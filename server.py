@@ -84,6 +84,58 @@ def matching(
     ]
 
 
+def resolve_place(name: str) -> tuple[str, str]:
+    """Return ("official" | "local", exact name), matching case-insensitively."""
+    lowered = name.strip().lower()
+    for official in NEIGHBORHOODS:
+        if official.lower() == lowered:
+            return "official", official
+    for local in LOCAL_NAMES:
+        if local.lower() == lowered:
+            return "local", local
+    suggestions = closest(name, NEIGHBORHOODS + LOCAL_NAMES)
+    hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+    raise ToolError(f"Unknown neighborhood {name!r}.{hint} Call dataset_info for the official names.")
+
+
+def in_local_area(
+    place: str, ctx: Context, boundary: str | None, verb: str
+) -> list[Request] | InputRequiredResult | str:
+    """The requests in local area `place`, asking which part when it spans several official neighborhoods.
+
+    Returns the requests, or something the tool should return as is: the
+    question to ask, or a message (saying nothing was `verb`) when the user
+    declines. Nothing is saved between calls: the retry re-derives everything.
+    """
+    in_area = [r for r in REQUESTS if r.local_name == place]
+    parts = sorted({r.neighborhood for r in in_area if r.neighborhood})
+    if len(parts) <= 1:
+        return in_area
+
+    all_option = f"All of {place}"
+    if boundary is None:
+        key = "boundary"
+        choice = read_choice(ctx, key)
+        if choice is None:
+            return ask_choice(
+                key,
+                f"{place} overlaps {len(parts)} official neighborhoods. Which part do you mean?",
+                parts + [all_option],
+            )
+        if not choice.accepted:
+            return (
+                f"Nothing was {verb}: no part of {place} was chosen. "
+                f"Call again with boundary set to one of {parts} or 'all'."
+            )
+        boundary = choice.value
+
+    if boundary.strip().lower() in ("all", all_option.lower()):
+        return in_area
+    if boundary not in parts:
+        raise ToolError(f"boundary must be one of {parts} or 'all' for {place}.")
+    return [r for r in in_area if r.neighborhood == boundary]
+
+
 def ranked(counter: Counter) -> dict[str, int]:
     pairs = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
     return dict(pairs[:MAX_ROWS])
@@ -124,28 +176,77 @@ def dataset_info() -> dict:
     }
 
 
+COLUMNS = {
+    "request_id": "Unique ID of the request. Pass it to get_request.",
+    "opened": "When the request was filed (ISO 8601, local time).",
+    "closed": "When the city closed it (ISO 8601), or null while it is still open.",
+    "status": "Open or Closed.",
+    "service": "What the request is about, such as Encampment or Graffiti. Exact names are in dataset_info.",
+    "subtype": "A finer category within the service.",
+    "agency": "The city agency responsible for handling it.",
+    "neighborhood": "One of the 41 official analysis neighborhoods, or empty when unknown.",
+    "local_name": "The name people use for the area, such as Lower Nob Hill. It can span several official neighborhoods.",
+    "address": "Where the problem is, shown only to the block (e.g. 900 block of HARRISON ST). Intersections are shown as is.",
+    "source": "How it was filed, such as Phone, Web, or Mobile.",
+}
+
+
+@mcp.resource(
+    "sf311://dataset/columns",
+    name="dataset_columns",
+    description="What each field of a 311 request means. Read this before interpreting tool results.",
+    mime_type="application/json",
+)
+def dataset_columns() -> dict:
+    """The fields every request row has, and what each one means."""
+    return {
+        "columns": COLUMNS,
+        "derived": {"hours_to_close": "Hours from opened to closed, only on closed requests (close_time_extremes)."},
+    }
+
+
 # --- Exercise 2 --------------------------------------------------------------
 
 
 @mcp.tool(annotations=READ_ONLY)
 def search_requests(
+    ctx: Context,
     service: str | None = None,
     neighborhood: str | None = None,
     status: Literal["Open", "Closed"] | None = None,
     limit: int = 20,
-) -> list[dict]:
+    boundary: str | None = None,
+) -> list[dict] | str | InputRequiredResult:
     """List individual 311 requests, newest first, with addresses shown only to the block.
 
     Use this to show examples or look at a few specific requests. Do not use it
     to count or rank: use count_requests for totals and breakdowns, and
-    median_close_hours for how fast requests close. `service` and
-    `neighborhood` must be exact names from dataset_info (official
-    neighborhoods only; for local names like "Lower Nob Hill" use
-    count_in_neighborhood). `limit` is 1 to 50.
+    median_close_hours for how fast requests close. `service` must be an exact
+    name from dataset_info. `neighborhood` is an official neighborhood or a
+    local name such as "Lower Nob Hill"; when a local name spans several
+    official neighborhoods the user is asked which part, unless you pass
+    `boundary` (one of those official neighborhoods, or "all"). `limit` is
+    1 to 50.
     """
     if not 1 <= limit <= MAX_ROWS:
         raise ToolError(f"limit must be between 1 and {MAX_ROWS}; use count_requests if you need totals.")
+    check_name(service, SERVICES, "service")
+
+    area = None
+    if neighborhood is not None and neighborhood not in NEIGHBORHOODS:
+        kind, place = resolve_place(neighborhood)
+        if kind == "official":
+            neighborhood = place
+        else:
+            area = in_local_area(place, ctx, boundary, "listed")
+            if not isinstance(area, list):
+                return area
+            neighborhood = None
+
     rows = matching(service, neighborhood, status)
+    if area is not None:
+        ids = {r.request_id for r in area}
+        rows = [r for r in rows if r.request_id in ids]
     rows.sort(key=lambda r: r.opened, reverse=True)
     return [public(r) for r in rows[:limit]]
 
@@ -273,20 +374,6 @@ def neighborhood_speed_gap(service: str | None = None, limit: int = 10) -> list[
 # --- Exercise 4 --------------------------------------------------------------
 
 
-def resolve_place(name: str) -> tuple[str, str]:
-    """Return ("official" | "local", exact name), matching case-insensitively."""
-    lowered = name.strip().lower()
-    for official in NEIGHBORHOODS:
-        if official.lower() == lowered:
-            return "official", official
-    for local in LOCAL_NAMES:
-        if local.lower() == lowered:
-            return "local", local
-    suggestions = closest(name, NEIGHBORHOODS + LOCAL_NAMES)
-    hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
-    raise ToolError(f"Unknown neighborhood {name!r}.{hint}")
-
-
 @mcp.tool(annotations=READ_ONLY)
 def count_in_neighborhood(
     name: str,
@@ -308,32 +395,10 @@ def count_in_neighborhood(
     if kind == "official":
         return sum(1 for r in REQUESTS if r.neighborhood == place)
 
-    in_area = [r for r in REQUESTS if r.local_name == place]
-    parts = sorted({r.neighborhood for r in in_area if r.neighborhood})
     if breakdown:
-        return ranked(Counter(r.neighborhood for r in in_area if r.neighborhood))
-    if len(parts) <= 1:
-        return len(in_area)
-
-    all_option = f"All of {place}"
-    if boundary is None:
-        key = "boundary"
-        choice = read_choice(ctx, key)
-        if choice is None:
-            return ask_choice(
-                key,
-                f"{place} overlaps {len(parts)} official neighborhoods. Which part should I count?",
-                parts + [all_option],
-            )
-        if not choice.accepted:
-            return f"Nothing was counted: no part of {place} was chosen. Call again with boundary set to one of {parts} or 'all'."
-        boundary = choice.value
-
-    if boundary.lower() in ("all", all_option.lower()):
-        return len(in_area)
-    if boundary not in parts:
-        raise ToolError(f"boundary must be one of {parts} or 'all' for {place}.")
-    return sum(1 for r in in_area if r.neighborhood == boundary)
+        return ranked(Counter(r.neighborhood for r in REQUESTS if r.local_name == place and r.neighborhood))
+    rows = in_local_area(place, ctx, boundary, "counted")
+    return len(rows) if isinstance(rows, list) else rows
 
 
 if __name__ == "__main__":
